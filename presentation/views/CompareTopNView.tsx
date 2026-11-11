@@ -2,6 +2,9 @@
 
 import { useState, useTransition } from "react";
 import {
+  FIXED_FOLD,
+  FIXED_KI,
+  FIXED_KU,
   SUPPORTED_TOP_N_VALUES,
 } from "@/config/topn-best-params";
 import type { UserTopNComparisonEntity } from "@/domain/entities/recommendation.entity";
