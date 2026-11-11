@@ -1,13 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
+import { FIXED_FOLD, FIXED_KI, FIXED_KU } from "@/config/topn-best-params";
 import { container } from "@/di/container";
 
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = request.nextUrl;
-    const fold = Number.parseInt(searchParams.get("fold") ?? "1", 10) || 1;
-    const ku = Number.parseInt(searchParams.get("ku") ?? "17", 10) || 17;
-    const ki = Number.parseInt(searchParams.get("ki") ?? "8", 10) || 8;
+    const fold =
+      Number.parseInt(searchParams.get("fold") ?? String(FIXED_FOLD), 10) ||
+      FIXED_FOLD;
     const n = Number.parseInt(searchParams.get("n") ?? "10", 10) || 10;
+    const ku =
+      Number.parseInt(searchParams.get("ku") ?? String(FIXED_KU), 10) ||
+      FIXED_KU;
+    const ki =
+      Number.parseInt(searchParams.get("ki") ?? String(FIXED_KI), 10) ||
+      FIXED_KI;
     const threshold =
       Number.parseInt(searchParams.get("thr") ?? "4", 10) || 4;
 

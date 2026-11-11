@@ -70,7 +70,8 @@ function buildTopNList(
 function calculateMetrics(
   items: readonly TopNItemEntity[],
   totalRelevant: number,
-  n: number
+  n: number,
+  executionTimeMs: number
 ): UserEvalMetricsEntity {
   let hits = 0;
   let dcg = 0;
@@ -107,6 +108,7 @@ function calculateMetrics(
     f1,
     dcg,
     ndcg,
+    executionTimeMs: Number(executionTimeMs.toFixed(3)),
   };
 }
 
@@ -152,9 +154,9 @@ export class RecommendationRepositoryImpl implements IRecommendationRepository {
   ): Promise<UserTopNComparisonEntity> {
     const fold = Math.max(1, Math.min(5, params.fold));
     const userId = params.userId;
-    const ku = params.ku ?? 17;
-    const ki = params.ki ?? 8;
     const n = params.n ?? 10;
+    const ku = params.ku ?? 20;
+    const ki = params.ki ?? 16;
     const threshold = params.threshold ?? 4;
 
     const db = getSqliteDatabase();
@@ -192,10 +194,20 @@ export class RecommendationRepositoryImpl implements IRecommendationRepository {
       .all(fold, userId) as unknown as { item_id: number; rating: number }[];
 
     const testRatingMap = new Map<number, number>();
-    const groundTruth: GroundTruthItemEntity[] = gtRows.map((row, idx) => {
+    let totalRelevant = 0;
+    for (const row of gtRows) {
       const itemId = Number(row.item_id);
       const rating = Number(row.rating);
       testRatingMap.set(itemId, rating);
+      if (rating >= threshold) {
+        totalRelevant++;
+      }
+    }
+
+    // Seluruh data ground truth uji untuk user ini (terurut rating DESC, item_id ASC)
+    const groundTruth: GroundTruthItemEntity[] = gtRows.map((row, idx) => {
+      const itemId = Number(row.item_id);
+      const rating = Number(row.rating);
       const movie = movieMap.get(itemId) ?? {
         title: `Film #${itemId}`,
         link: "",
@@ -210,12 +222,16 @@ export class RecommendationRepositoryImpl implements IRecommendationRepository {
       };
     });
 
-    const totalRelevant = groundTruth.filter((g) => g.relevant).length;
+    // Hitung log-posterior NBCF Biasa & NBCF + Klaster beserta waktu eksekusinya
+    const {
+      candidateItems,
+      basePosteriors,
+      clusterPosteriors,
+      baseTimeMs,
+      clusterTimeMs,
+    } = computeUserCandidatePosteriors(fold, userId, ku, ki);
 
-    // Hitung log-posterior NBCF Biasa & NBCF + Klaster
-    const { candidateItems, basePosteriors, clusterPosteriors } =
-      computeUserCandidatePosteriors(fold, userId, ku, ki);
-
+    const tSortBaseStart = performance.now();
     const nbcfItems = buildTopNList(
       candidateItems,
       basePosteriors,
@@ -224,7 +240,10 @@ export class RecommendationRepositoryImpl implements IRecommendationRepository {
       testRatingMap,
       threshold
     );
+    const totalBaseTimeMs =
+      baseTimeMs + (performance.now() - tSortBaseStart);
 
+    const tSortClusStart = performance.now();
     const clusteredItems = buildTopNList(
       candidateItems,
       clusterPosteriors,
@@ -233,9 +252,21 @@ export class RecommendationRepositoryImpl implements IRecommendationRepository {
       testRatingMap,
       threshold
     );
+    const totalClusTimeMs =
+      clusterTimeMs + (performance.now() - tSortClusStart);
 
-    const nbcfMetrics = calculateMetrics(nbcfItems, totalRelevant, n);
-    const clusteredMetrics = calculateMetrics(clusteredItems, totalRelevant, n);
+    const nbcfMetrics = calculateMetrics(
+      nbcfItems,
+      totalRelevant,
+      n,
+      totalBaseTimeMs
+    );
+    const clusteredMetrics = calculateMetrics(
+      clusteredItems,
+      totalRelevant,
+      n,
+      totalClusTimeMs
+    );
 
     return {
       fold,

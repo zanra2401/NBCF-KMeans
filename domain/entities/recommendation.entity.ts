@@ -32,6 +32,7 @@ export interface UserEvalMetricsEntity {
   readonly f1: number;
   readonly dcg: number;
   readonly ndcg: number;
+  readonly executionTimeMs: number;
 }
 
 export interface UserTopNComparisonEntity {

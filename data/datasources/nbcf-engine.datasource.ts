@@ -170,12 +170,21 @@ function getFoldCache(fold: number): FoldCache {
   return built;
 }
 
+const clusterCacheMap = new Map<
+  string,
+  { userClusters: Int32Array; itemClusters: Int32Array }
+>();
+
 function loadClusterLabels(
   fold: number,
   ku: number,
   ki: number,
   cache: FoldCache
 ): { userClusters: Int32Array; itemClusters: Int32Array } {
+  const key = `v2:${fold}:${ku}:${ki}`;
+  const cached = clusterCacheMap.get(key);
+  if (cached) return cached;
+
   const db = getSqliteDatabase();
   const userClusters = new Int32Array(cache.users.length).fill(-1);
   const itemClusters = new Int32Array(cache.items.length).fill(-1);
@@ -208,7 +217,9 @@ function loadClusterLabels(
     }
   }
 
-  return { userClusters, itemClusters };
+  const res = { userClusters, itemClusters };
+  clusterCacheMap.set(key, res);
+  return res;
 }
 
 /**
@@ -267,11 +278,13 @@ export interface ComputedCandidateResult {
   readonly candidateItems: Int32Array;
   readonly basePosteriors: Float32Array; // (nq * 5)
   readonly clusterPosteriors: Float32Array; // (nq * 5)
+  readonly baseTimeMs: number;
+  readonly clusterTimeMs: number;
 }
 
 /**
  * Menghitung log-posterior hybrid NBCF Biasa (ku=0, ki=0) dan NBCF + Klaster (ku, ki)
- * untuk seluruh kandidat item dari satu user pada satu fold.
+ * secara terpisah agar waktu eksekusi masing-masing metode dapat diukur secara akurat.
  */
 export function computeUserCandidatePosteriors(
   fold: number,
@@ -302,51 +315,12 @@ export function computeUserCandidatePosteriors(
   }
   const candidateItems = Int32Array.from(candList);
   const nq = candidateItems.length;
+  const candItemPos = new Int32Array(nq);
+  for (let q = 0; q < nq; q++) {
+    candItemPos[q] = cache.itemToPos.get(candidateItems[q]) ?? -1;
+  }
 
   const { userClusters, itemClusters } = loadClusterLabels(fold, ku, ki, cache);
-  const targetUserCluster = uPos >= 0 ? userClusters[uPos] : -1;
-
-  // ============================================================================
-  // 1. ITEM-BASED SIDE (side_i = Side(X)): entity = uPos, feature = item
-  // ============================================================================
-  // Hitung T[k_, n_, r] dan D[n_, r] untuk target user uPos terhadap semua neighbor user n_
-  const D_i = new Float32Array(nUsers * R);
-  const T_i = new Float32Array(R * nUsers * R);
-
-  if (uPos >= 0) {
-    const uStart = cache.userRowOffsets[uPos];
-    const uEnd = cache.userRowOffsets[uPos + 1];
-    for (let idx = uStart; idx < uEnd; idx++) {
-      const featItemPos = cache.userRowItems[idx];
-      const uRatingIdx = cache.userRowRatings[idx]; // r (0..4)
-
-      const iStart = cache.itemRowOffsets[featItemPos];
-      const iEnd = cache.itemRowOffsets[featItemPos + 1];
-      for (let j = iStart; j < iEnd; j++) {
-        const nbUserPos = cache.itemRowUsers[j];
-        const nbRatingIdx = cache.itemRowRatings[j]; // k_ (0..4)
-        D_i[nbUserPos * R + uRatingIdx] += 1.0;
-        T_i[(nbRatingIdx * nUsers + nbUserPos) * R + uRatingIdx] += 1.0;
-      }
-    }
-  }
-
-  // Tabel log-likelihood L_i[(nbUserPos * R + k_) * R + r]
-  const L_i = new Float32Array(nUsers * R * R);
-  if (uPos >= 0) {
-    for (let nb = 0; nb < nUsers; nb++) {
-      for (let k = 0; k < R; k++) {
-        const baseL = (nb * R + k) * R;
-        const baseT = (k * nUsers + nb) * R;
-        const baseD = nb * R;
-        for (let r = 0; r < R; r++) {
-          const num = Math.fround(T_i[baseT + r] + ALPHA);
-          const den = Math.fround(D_i[baseD + r] + R_ALPHA);
-          L_i[baseL + r] = Math.fround(Math.log(Math.fround(num / den)));
-        }
-      }
-    }
-  }
 
   const prior_i = new Float32Array(R);
   if (uPos >= 0) {
@@ -357,75 +331,85 @@ export function computeUserCandidatePosteriors(
     prior_i.fill(LOG_UNIFORM_PRIOR);
   }
 
+  const uStart = uPos >= 0 ? cache.userRowOffsets[uPos] : 0;
+  const uEnd = uPos >= 0 ? cache.userRowOffsets[uPos + 1] : 0;
+  const numNbItems = uEnd - uStart;
+
+  // ============================================================================
+  // A. EKSEKUSI STANDALONE NBCF BIASA (ku = 0, ki = 0)
+  // ============================================================================
+  const tBaseStart = performance.now();
+
+  // 1A. Item-Based NBCF Biasa (seluruh neighbor user)
+  const D_i_base = new Float32Array(nUsers * R);
+  const T_i_base = new Float32Array(R * nUsers * R);
+
+  if (uPos >= 0) {
+    for (let idx = uStart; idx < uEnd; idx++) {
+      const featItemPos = cache.userRowItems[idx];
+      const uRatingIdx = cache.userRowRatings[idx];
+      const iStart = cache.itemRowOffsets[featItemPos];
+      const iEnd = cache.itemRowOffsets[featItemPos + 1];
+      for (let j = iStart; j < iEnd; j++) {
+        const nbUserPos = cache.itemRowUsers[j];
+        const nbRatingIdx = cache.itemRowRatings[j];
+        D_i_base[nbUserPos * R + uRatingIdx] += 1.0;
+        T_i_base[(nbRatingIdx * nUsers + nbUserPos) * R + uRatingIdx] += 1.0;
+      }
+    }
+  }
+
+  const L_i_base = new Float32Array(nUsers * R * R);
+  if (uPos >= 0) {
+    for (let nb = 0; nb < nUsers; nb++) {
+      for (let k = 0; k < R; k++) {
+        const baseL = (nb * R + k) * R;
+        const baseT = (k * nUsers + nb) * R;
+        const baseD = nb * R;
+        for (let r = 0; r < R; r++) {
+          const num = Math.fround(T_i_base[baseT + r] + ALPHA);
+          const den = Math.fround(D_i_base[baseD + r] + R_ALPHA);
+          L_i_base[baseL + r] = Math.fround(Math.log(Math.fround(num / den)));
+        }
+      }
+    }
+  }
+
   const post_i_base = new Float32Array(nq * R);
   const pw_i_base = new Float32Array(nq);
-  const post_i_clus = new Float32Array(nq * R);
-  const pw_i_clus = new Float32Array(nq);
-
   const full_i = new Float32Array(R);
-  const filt_i = new Float32Array(R);
 
   for (let q = 0; q < nq; q++) {
-    const bPos = cache.itemToPos.get(candidateItems[q]) ?? -1;
+    const bPos = candItemPos[q];
     full_i.fill(0);
-    filt_i.fill(0);
     let lens = 0;
-    let cnt = 0;
 
     if (bPos >= 0) {
       const iStart = cache.itemRowOffsets[bPos];
       const iEnd = cache.itemRowOffsets[bPos + 1];
       lens = iEnd - iStart;
-
       if (uPos >= 0) {
         for (let j = iStart; j < iEnd; j++) {
           const nbUserPos = cache.itemRowUsers[j];
           const k = cache.itemRowRatings[j];
           const lOff = (nbUserPos * R + k) * R;
-          const sameCluster =
-            ku > 0 && userClusters[nbUserPos] === targetUserCluster;
-          if (sameCluster) cnt++;
-
           for (let r = 0; r < R; r++) {
-            const lv = L_i[lOff + r];
-            full_i[r] = Math.fround(full_i[r] + lv);
-            if (sameCluster) {
-              filt_i[r] = Math.fround(filt_i[r] + lv);
-            }
+            full_i[r] = Math.fround(full_i[r] + L_i_base[lOff + r]);
           }
         }
       }
     }
 
-    const useClus = cnt > 0;
-    const cClus = useClus ? cnt : lens;
     pw_i_base[q] = Math.fround(1.0 / (1.0 + lens));
-    pw_i_clus[q] = Math.fround(1.0 / (1.0 + cClus));
-
     const qOff = q * R;
     for (let r = 0; r < R; r++) {
       post_i_base[qOff + r] = Math.fround(prior_i[r] + full_i[r]);
-      post_i_clus[qOff + r] = Math.fround(
-        prior_i[r] + (useClus ? filt_i[r] : full_i[r])
-      );
     }
   }
 
-  // ============================================================================
-  // 2. USER-BASED SIDE (side_u = Side(XT)): entity = candItem aPos, feature = user
-  // ============================================================================
-  // Neighbor dari b = uPos pada XT adalah item-item yang dirating oleh uPos di train
-  const uStart = uPos >= 0 ? cache.userRowOffsets[uPos] : 0;
-  const uEnd = uPos >= 0 ? cache.userRowOffsets[uPos + 1] : 0;
-  const numNbItems = uEnd - uStart; // M
-
+  // 2A. User-Based NBCF Biasa (seluruh neighbor item)
   const nbItemPosList = new Int32Array(numNbItems);
   const nbItemRatingList = new Uint8Array(numNbItems);
-  const nbItemClusterList = new Int32Array(numNbItems);
-
-  // Untuk mempercepat perhitungan D_u dan T_u per kandidat item aPos:
-  // Untuk setiap user w (0..nUsers-1), simpan daftar indeks j (0..numNbItems-1)
-  // dari item neighbor yang pernah dirating user w, serta apakah ratingnya sama dengan k_
   const userToNbOffsets = new Int32Array(nUsers + 1);
   const tempCounts = new Int32Array(nUsers);
 
@@ -434,7 +418,6 @@ export function computeUserCandidatePosteriors(
     const k = cache.userRowRatings[uStart + j];
     nbItemPosList[j] = nbItemPos;
     nbItemRatingList[j] = k;
-    nbItemClusterList[j] = ki > 0 ? itemClusters[nbItemPos] : -1;
 
     const s = cache.itemRowOffsets[nbItemPos];
     const e = cache.itemRowOffsets[nbItemPos + 1];
@@ -467,92 +450,344 @@ export function computeUserCandidatePosteriors(
   }
 
   const basePosteriors = new Float32Array(nq * R);
-  const clusterPosteriors = new Float32Array(nq * R);
-
-  const D_u = new Float32Array(numNbItems * R);
-  const T_u = new Float32Array(numNbItems * R);
+  const D_u_base = new Float32Array(numNbItems * R);
+  const T_u_base = new Float32Array(numNbItems * R);
   const full_u = new Float32Array(R);
-  const filt_u = new Float32Array(R);
+  const pw_u_b = Math.fround(1.0 / (1.0 + numNbItems));
 
   for (let q = 0; q < nq; q++) {
-    const aPos = cache.itemToPos.get(candidateItems[q]) ?? -1;
-    const lens = numNbItems;
-    let cnt = 0;
+    const aPos = candItemPos[q];
     full_u.fill(0);
-    filt_u.fill(0);
 
     if (aPos >= 0 && numNbItems > 0) {
-      D_u.fill(0);
-      T_u.fill(0);
+      D_u_base.fill(0);
+      T_u_base.fill(0);
 
       const iStart = cache.itemRowOffsets[aPos];
       const iEnd = cache.itemRowOffsets[aPos + 1];
       for (let idx = iStart; idx < iEnd; idx++) {
         const wUser = cache.itemRowUsers[idx];
-        const r = cache.itemRowRatings[idx]; // rating wUser pada kandidat item aPos (0..4)
-
+        const r = cache.itemRowRatings[idx];
         const lStart = userToNbOffsets[wUser];
         const lEnd = userToNbOffsets[wUser + 1];
         for (let l = lStart; l < lEnd; l++) {
           const j = userToNbIdx[l];
           const dIdx = j * R + r;
-          D_u[dIdx] += 1.0;
+          D_u_base[dIdx] += 1.0;
           if (userToNbSameRating[l] === 1) {
-            T_u[dIdx] += 1.0;
+            T_u_base[dIdx] += 1.0;
           }
         }
       }
 
-      const targetItemCluster = ki > 0 ? itemClusters[aPos] : -1;
       for (let j = 0; j < numNbItems; j++) {
-        const sameCluster =
-          ki > 0 && nbItemClusterList[j] === targetItemCluster;
-        if (sameCluster) cnt++;
         const jOff = j * R;
         for (let r = 0; r < R; r++) {
-          const num = Math.fround(T_u[jOff + r] + ALPHA);
-          const den = Math.fround(D_u[jOff + r] + R_ALPHA);
+          const num = Math.fround(T_u_base[jOff + r] + ALPHA);
+          const den = Math.fround(D_u_base[jOff + r] + R_ALPHA);
           const lv = Math.fround(Math.log(Math.fround(num / den)));
           full_u[r] = Math.fround(full_u[r] + lv);
-          if (sameCluster) {
-            filt_u[r] = Math.fround(filt_u[r] + lv);
-          }
         }
       }
     }
 
-    const useClus = aPos >= 0 && cnt > 0;
-    const cClus = useClus ? cnt : lens;
-    const pw_u_b = Math.fround(1.0 / (1.0 + lens));
-    const pw_u_c = Math.fround(1.0 / (1.0 + cClus));
-
     const pw_i_b = pw_i_base[q];
-    const pw_i_c = pw_i_clus[q];
-
     const qOff = q * R;
     for (let r = 0; r < R; r++) {
       const pr_u =
         aPos >= 0 ? cache.itemLogPrior[aPos * R + r] : LOG_UNIFORM_PRIOR;
       const post_u_b = Math.fround(pr_u + full_u[r]);
-      const post_u_c = Math.fround(pr_u + (useClus ? filt_u[r] : full_u[r]));
-
       const hybBase = Math.fround(
         Math.fround(pw_i_b * post_i_base[qOff + r]) +
           Math.fround(pw_u_b * post_u_b)
       );
-      const hybClus = Math.fround(
-        Math.fround(pw_i_c * post_i_clus[qOff + r]) +
-          Math.fround(pw_u_c * post_u_c)
-      );
-
       basePosteriors[qOff + r] = roundFloat16(hybBase);
-      clusterPosteriors[qOff + r] = roundFloat16(hybClus);
     }
   }
+
+  const tBaseEnd = performance.now();
+  const baseTimeMs = tBaseEnd - tBaseStart;
+
+  // ============================================================================
+  // B. EKSEKUSI STANDALONE NBCF + KLASTER (ku, ki)
+  // ============================================================================
+  const tClusStart = performance.now();
+  const targetUserCluster = uPos >= 0 ? userClusters[uPos] : -1;
+
+  // 1B. Item-Based NBCF + Klaster (hanya menghitung neighbor user dalam klaster yang sama)
+  const D_i_clus = new Float32Array(nUsers * R);
+  const T_i_clus = new Float32Array(R * nUsers * R);
+
+  if (uPos >= 0) {
+    for (let idx = uStart; idx < uEnd; idx++) {
+      const featItemPos = cache.userRowItems[idx];
+      const uRatingIdx = cache.userRowRatings[idx];
+      const iStart = cache.itemRowOffsets[featItemPos];
+      const iEnd = cache.itemRowOffsets[featItemPos + 1];
+      for (let j = iStart; j < iEnd; j++) {
+        const nbUserPos = cache.itemRowUsers[j];
+        if (ku === 0 || userClusters[nbUserPos] === targetUserCluster) {
+          const nbRatingIdx = cache.itemRowRatings[j];
+          D_i_clus[nbUserPos * R + uRatingIdx] += 1.0;
+          T_i_clus[(nbRatingIdx * nUsers + nbUserPos) * R + uRatingIdx] += 1.0;
+        }
+      }
+    }
+  }
+
+  const L_i_clus = new Float32Array(nUsers * R * R);
+  if (uPos >= 0) {
+    for (let nb = 0; nb < nUsers; nb++) {
+      if (ku > 0 && userClusters[nb] !== targetUserCluster) continue;
+      for (let k = 0; k < R; k++) {
+        const baseL = (nb * R + k) * R;
+        const baseT = (k * nUsers + nb) * R;
+        const baseD = nb * R;
+        for (let r = 0; r < R; r++) {
+          const num = Math.fround(T_i_clus[baseT + r] + ALPHA);
+          const den = Math.fround(D_i_clus[baseD + r] + R_ALPHA);
+          L_i_clus[baseL + r] = Math.fround(Math.log(Math.fround(num / den)));
+        }
+      }
+    }
+  }
+
+  const post_i_clus = new Float32Array(nq * R);
+  const pw_i_clus = new Float32Array(nq);
+  const filt_i = new Float32Array(R);
+
+  for (let q = 0; q < nq; q++) {
+    const bPos = candItemPos[q];
+    filt_i.fill(0);
+    let lens = 0;
+    let cnt = 0;
+
+    if (bPos >= 0) {
+      const iStart = cache.itemRowOffsets[bPos];
+      const iEnd = cache.itemRowOffsets[bPos + 1];
+      lens = iEnd - iStart;
+
+      if (uPos >= 0) {
+        for (let j = iStart; j < iEnd; j++) {
+          const nbUserPos = cache.itemRowUsers[j];
+          if (ku === 0 || userClusters[nbUserPos] === targetUserCluster) {
+            cnt++;
+            const k = cache.itemRowRatings[j];
+            const lOff = (nbUserPos * R + k) * R;
+            for (let r = 0; r < R; r++) {
+              filt_i[r] = Math.fround(filt_i[r] + L_i_clus[lOff + r]);
+            }
+          }
+        }
+      }
+    }
+
+    const useClus = cnt > 0;
+    const cClus = useClus ? cnt : lens;
+    pw_i_clus[q] = Math.fround(1.0 / (1.0 + cClus));
+
+    const qOff = q * R;
+    if (useClus) {
+      for (let r = 0; r < R; r++) {
+        post_i_clus[qOff + r] = Math.fround(prior_i[r] + filt_i[r]);
+      }
+    } else {
+      // Fallback ke NBCF biasa jika tidak ada neighbor di klaster yang sama
+      for (let r = 0; r < R; r++) {
+        post_i_clus[qOff + r] = post_i_base[qOff + r];
+      }
+    }
+  }
+
+  // 2B. User-Based NBCF + Klaster (indeks neighbor item dikelompokkan per klaster ki)
+  const numItemClusters = Math.max(1, ki);
+  const clusterNbCounts = new Int32Array(numItemClusters);
+  const nbItemClusterList = new Int32Array(numNbItems);
+
+  for (let j = 0; j < numNbItems; j++) {
+    const nbItemPos = cache.userRowItems[uStart + j];
+    const c = ki > 0 ? itemClusters[nbItemPos] : 0;
+    nbItemClusterList[j] = c;
+    if (c >= 0 && c < numItemClusters) {
+      clusterNbCounts[c]++;
+    }
+  }
+
+  // Bangun struktur indeks CSR per klaster item c agar kandidat item di klaster c
+  // hanya mengevaluasi neighbor item yang berada di klaster c
+  const clusUserToNbOffsets: Int32Array[] = new Array(numItemClusters);
+  const clusUserToNbLocalIdx: Int32Array[] = new Array(numItemClusters);
+  const clusUserToNbSameRating: Uint8Array[] = new Array(numItemClusters);
+
+  for (let c = 0; c < numItemClusters; c++) {
+    const cntC = clusterNbCounts[c];
+    if (cntC === 0) continue;
+
+    const offsets = new Int32Array(nUsers + 1);
+    const tCounts = new Int32Array(nUsers);
+
+    for (let j = 0; j < numNbItems; j++) {
+      if (nbItemClusterList[j] !== c) continue;
+      const nbItemPos = cache.userRowItems[uStart + j];
+      const s = cache.itemRowOffsets[nbItemPos];
+      const e = cache.itemRowOffsets[nbItemPos + 1];
+      for (let idx = s; idx < e; idx++) {
+        tCounts[cache.itemRowUsers[idx]]++;
+      }
+    }
+
+    for (let u = 0; u < nUsers; u++) {
+      offsets[u + 1] = offsets[u] + tCounts[u];
+    }
+
+    const tot = offsets[nUsers];
+    const localIdxArr = new Int32Array(tot);
+    const sameRatArr = new Uint8Array(tot);
+    const wCur = Int32Array.from(offsets.subarray(0, nUsers));
+
+    let localJ = 0;
+    for (let j = 0; j < numNbItems; j++) {
+      if (nbItemClusterList[j] !== c) continue;
+      const nbItemPos = cache.userRowItems[uStart + j];
+      const k = cache.userRowRatings[uStart + j];
+      const s = cache.itemRowOffsets[nbItemPos];
+      const e = cache.itemRowOffsets[nbItemPos + 1];
+      for (let idx = s; idx < e; idx++) {
+        const wUser = cache.itemRowUsers[idx];
+        const wRating = cache.itemRowRatings[idx];
+        const pos = wCur[wUser]++;
+        localIdxArr[pos] = localJ;
+        sameRatArr[pos] = wRating === k ? 1 : 0;
+      }
+      localJ++;
+    }
+
+    clusUserToNbOffsets[c] = offsets;
+    clusUserToNbLocalIdx[c] = localIdxArr;
+    clusUserToNbSameRating[c] = sameRatArr;
+  }
+
+  const clusterPosteriors = new Float32Array(nq * R);
+  const D_u_clus = new Float32Array(numNbItems * R);
+  const T_u_clus = new Float32Array(numNbItems * R);
+  const filt_u = new Float32Array(R);
+
+  for (let q = 0; q < nq; q++) {
+    const aPos = candItemPos[q];
+    const targetItemCluster =
+      aPos >= 0 ? (ki > 0 ? itemClusters[aPos] : 0) : -1;
+    const cnt =
+      targetItemCluster >= 0 && targetItemCluster < numItemClusters
+        ? clusterNbCounts[targetItemCluster]
+        : 0;
+    const useClus = aPos >= 0 && cnt > 0;
+    const cClus = useClus ? cnt : numNbItems;
+    const pw_u_c = Math.fround(1.0 / (1.0 + cClus));
+    const pw_i_c = pw_i_clus[q];
+    const qOff = q * R;
+
+    filt_u.fill(0);
+
+    if (useClus) {
+      const lenBuf = cnt * R;
+      for (let z = 0; z < lenBuf; z++) {
+        D_u_clus[z] = 0;
+        T_u_clus[z] = 0;
+      }
+
+      const cOffsets = clusUserToNbOffsets[targetItemCluster];
+      const cLocalIdx = clusUserToNbLocalIdx[targetItemCluster];
+      const cSameRat = clusUserToNbSameRating[targetItemCluster];
+
+      const iStart = cache.itemRowOffsets[aPos];
+      const iEnd = cache.itemRowOffsets[aPos + 1];
+      for (let idx = iStart; idx < iEnd; idx++) {
+        const wUser = cache.itemRowUsers[idx];
+        const r = cache.itemRowRatings[idx];
+        const lStart = cOffsets[wUser];
+        const lEnd = cOffsets[wUser + 1];
+        for (let l = lStart; l < lEnd; l++) {
+          const localJ = cLocalIdx[l];
+          const dIdx = localJ * R + r;
+          D_u_clus[dIdx] += 1.0;
+          if (cSameRat[l] === 1) {
+            T_u_clus[dIdx] += 1.0;
+          }
+        }
+      }
+
+      for (let localJ = 0; localJ < cnt; localJ++) {
+        const jOff = localJ * R;
+        for (let r = 0; r < R; r++) {
+          const num = Math.fround(T_u_clus[jOff + r] + ALPHA);
+          const den = Math.fround(D_u_clus[jOff + r] + R_ALPHA);
+          const lv = Math.fround(Math.log(Math.fround(num / den)));
+          filt_u[r] = Math.fround(filt_u[r] + lv);
+        }
+      }
+
+      for (let r = 0; r < R; r++) {
+        const pr_u = cache.itemLogPrior[aPos * R + r];
+        const post_u_c = Math.fround(pr_u + filt_u[r]);
+        const hybClus = Math.fround(
+          Math.fround(pw_i_c * post_i_clus[qOff + r]) +
+            Math.fround(pw_u_c * post_u_c)
+        );
+        clusterPosteriors[qOff + r] = roundFloat16(hybClus);
+      }
+    } else {
+      // Fallback jika kandidat item berada pada klaster yang belum pernah dirating user
+      if (aPos >= 0 && numNbItems > 0) {
+        D_u_clus.fill(0);
+        T_u_clus.fill(0);
+        const iStart = cache.itemRowOffsets[aPos];
+        const iEnd = cache.itemRowOffsets[aPos + 1];
+        for (let idx = iStart; idx < iEnd; idx++) {
+          const wUser = cache.itemRowUsers[idx];
+          const r = cache.itemRowRatings[idx];
+          const lStart = userToNbOffsets[wUser];
+          const lEnd = userToNbOffsets[wUser + 1];
+          for (let l = lStart; l < lEnd; l++) {
+            const j = userToNbIdx[l];
+            const dIdx = j * R + r;
+            D_u_clus[dIdx] += 1.0;
+            if (userToNbSameRating[l] === 1) {
+              T_u_clus[dIdx] += 1.0;
+            }
+          }
+        }
+        for (let j = 0; j < numNbItems; j++) {
+          const jOff = j * R;
+          for (let r = 0; r < R; r++) {
+            const num = Math.fround(T_u_clus[jOff + r] + ALPHA);
+            const den = Math.fround(D_u_clus[jOff + r] + R_ALPHA);
+            const lv = Math.fround(Math.log(Math.fround(num / den)));
+            filt_u[r] = Math.fround(filt_u[r] + lv);
+          }
+        }
+      }
+
+      for (let r = 0; r < R; r++) {
+        const pr_u =
+          aPos >= 0 ? cache.itemLogPrior[aPos * R + r] : LOG_UNIFORM_PRIOR;
+        const post_u_c = Math.fround(pr_u + filt_u[r]);
+        const hybClus = Math.fround(
+          Math.fround(pw_i_c * post_i_clus[qOff + r]) +
+            Math.fround(pw_u_c * post_u_c)
+        );
+        clusterPosteriors[qOff + r] = roundFloat16(hybClus);
+      }
+    }
+  }
+
+  const tClusEnd = performance.now();
+  const clusterTimeMs = tClusEnd - tClusStart;
 
   return {
     candidateItems,
     basePosteriors,
     clusterPosteriors,
+    baseTimeMs,
+    clusterTimeMs,
   };
 }

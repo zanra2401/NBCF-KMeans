@@ -22,7 +22,7 @@ export function HomeView({ totalMovies, totalUsers }: HomeViewProps) {
           <strong>Naive Bayes Collaborative Filtering (NBCF)</strong> standar
           dibandingkan dengan <strong>NBCF berbasis Klaster K-Means</strong> dan{" "}
           <strong>Ground Truth</strong> beserta metrik evaluasi{" "}
-          <strong>Precision, Recall, F1-Score, DCG, dan NDCG</strong>.
+          <strong>Hits, NDCG, dan Waktu Komputasi</strong>.
         </p>
         <div className="mt-6">
           <Link
