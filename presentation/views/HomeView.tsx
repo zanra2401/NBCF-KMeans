@@ -62,13 +62,13 @@ export function HomeView({ totalMovies, totalUsers }: HomeViewProps) {
 
         <div className="rounded-xl border border-zinc-200 bg-white p-6 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
           <p className="text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
-            Skema Evaluasi
+            Metode Rekomendasi
           </p>
           <p className="mt-2 text-3xl font-bold text-zinc-900 dark:text-zinc-50">
-            5-Fold CV
+            Hybrid NBCF
           </p>
           <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-            Klaster K-Means User &amp; Item (k = 2..20)
+            NBCF Biasa vs NBCF Berbasis Klaster K-Means
           </p>
         </div>
       </div>

@@ -2,9 +2,6 @@
 
 import { useState, useTransition } from "react";
 import {
-  FIXED_FOLD,
-  FIXED_KI,
-  FIXED_KU,
   SUPPORTED_TOP_N_VALUES,
 } from "@/config/topn-best-params";
 import type { UserTopNComparisonEntity } from "@/domain/entities/recommendation.entity";
@@ -98,15 +95,7 @@ export function CompareTopNView({
           Perbandingan NBCF vs NBCF + Klaster vs Ground Truth
         </h1>
         <p className="text-sm text-zinc-600 dark:text-zinc-400">
-          Evaluasi rekomendasi film dengan parameter klaster permanen{" "}
-          <span className="font-mono font-semibold text-zinc-800 dark:text-zinc-200">
-            ku={FIXED_KU}, ki={FIXED_KI}
-          </span>{" "}
-          pada{" "}
-          <span className="font-semibold text-zinc-800 dark:text-zinc-200">
-            Fold {FIXED_FOLD}
-          </span>
-          .
+          Evaluasi perbandingan rekomendasi film antara NBCF biasa, NBCF berbasis Klaster, dan data Ground Truth.
         </p>
       </div>
 
@@ -177,9 +166,6 @@ export function CompareTopNView({
               <strong className="text-zinc-900 dark:text-zinc-100">
                 User ID: {comparison.user.id}
               </strong>
-            </span>
-            <span className="inline-flex items-center rounded-md bg-blue-50 px-2 py-0.5 text-[11px] font-semibold text-blue-700 dark:bg-blue-950/60 dark:text-blue-300">
-              Fold: {FIXED_FOLD} &bull; ku={FIXED_KU}, ki={FIXED_KI}
             </span>
           </div>
           {isPending && (
@@ -265,8 +251,7 @@ export function CompareTopNView({
           <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3.5 dark:border-zinc-800">
             <div>
               <h3 className="text-sm font-bold text-blue-600 dark:text-blue-400">
-                2. Top-{comparison.n} NBCF + Klaster ({comparison.ku},{" "}
-                {comparison.ki})
+                2. Top-{comparison.n} NBCF + Klaster
               </h3>
               <p className="text-xs text-zinc-500 dark:text-zinc-400">
                 Urutan rating prediksi dengan klaster K-Means
@@ -392,13 +377,11 @@ export function CompareTopNView({
       {/* Tabel Metrik Evaluasi User (Diletakkan di Bawah Informasi List Top-N) */}
       <div className="rounded-xl border border-zinc-200 bg-white p-5 shadow-xs dark:border-zinc-800 dark:bg-zinc-900">
         <h2 className="text-base font-bold">
-          Metrik Evaluasi User #{comparison.user.id} pada Fold {comparison.fold}{" "}
-          (N = {comparison.n})
+          Metrik Evaluasi User #{comparison.user.id} (N = {comparison.n})
         </h2>
         <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
           Perbandingan nilai <strong>Hits, NDCG, dan Waktu Komputasi</strong>{" "}
-          antara NBCF Biasa vs NBCF + Klaster (ku={comparison.ku}, ki=
-          {comparison.ki}).
+          antara NBCF Biasa vs NBCF + Klaster.
         </p>
 
         <div className="mt-4 overflow-x-auto">
@@ -407,10 +390,10 @@ export function CompareTopNView({
               <tr>
                 <th className="px-4 py-2.5 font-semibold">Metrik</th>
                 <th className="px-4 py-2.5 font-semibold">
-                  NBCF Biasa (ku=0, ki=0)
+                  NBCF Biasa
                 </th>
                 <th className="px-4 py-2.5 font-semibold">
-                  NBCF + Klaster (ku={comparison.ku}, ki={comparison.ki})
+                  NBCF + Klaster
                 </th>
                 <th className="px-4 py-2.5 font-semibold">Selisih</th>
               </tr>
